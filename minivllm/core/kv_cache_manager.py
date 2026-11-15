@@ -10,6 +10,7 @@ block id in the BlockPool.
 
 import hashlib
 from dataclasses import dataclass, field
+from math import ceil
 
 from minivllm.core.block import BlockHash, BlockPool
 
@@ -35,26 +36,39 @@ class _RequestState:
 
 
 class KVCacheManager:
+    block_pool: BlockPool
+    block_size: int
+    enable_prefix_cache: bool
+    request_block_table: dict[str, _RequestState]
+
     def __init__(self, num_blocks: int, block_size: int, enable_prefix_cache: bool = False) -> None:
         """[Step 3] Own one BlockPool plus a per-request block table."""
-        raise NotImplementedError("Step 3: implement __init__")
+        self.block_pool = BlockPool(num_blocks)
+        self.block_size = block_size
+        self.enable_prefix_cache = enable_prefix_cache
+        self.request_block_table = {}
 
     @property
     def num_free_blocks(self) -> int:
         """[Step 3]"""
-        raise NotImplementedError("Step 3: implement num_free_blocks")
+        return self.block_pool.num_free_blocks
 
     def num_blocks_for(self, num_tokens: int) -> int:
         """[Step 3] ceil(num_tokens / block_size)."""
-        raise NotImplementedError("Step 3: implement num_blocks_for")
+        return ceil(num_tokens / self.block_size)
 
     def register_request(self, request_id: str) -> None:
         """[Step 3] Start an empty block table. Duplicate ids are an error."""
-        raise NotImplementedError("Step 3: implement register_request")
+        if request_id in self.request_block_table:
+            raise ValueError(f"Request {request_id} already registered")
+        self.request_block_table[request_id] = _RequestState()
 
     def get_block_table(self, request_id: str) -> tuple[int, ...]:
         """[Step 3]"""
-        raise NotImplementedError("Step 3: implement get_block_table")
+        if request_id not in self.request_block_table:
+            raise KeyError(f"Request {request_id} not registered")
+    
+        return tuple(self.request_block_table[request_id].block_ids)
 
     def allocate_slots(
         self,
@@ -70,16 +84,38 @@ class KVCacheManager:
         [Step 15] With a prefix_hit the table must be empty; it becomes
         prefix_hit.block_ids (shared, ref_count += 1) followed by fresh blocks.
         """
-        raise NotImplementedError("Step 3: implement allocate_slots")
+        if request_id not in self.request_block_table:
+            return None
+        request_state = self.request_block_table[request_id]
+        total_token = num_computed_tokens + num_new_tokens
+        total_blocks = self.num_blocks_for(total_token)
+
+        # allocate missing blocks
+        missing_blocks = total_blocks - len(request_state.block_ids)
+        if missing_blocks > 0:
+            new_block_ids = self.block_pool.allocate(missing_blocks)
+            if new_block_ids is None:
+                return None
+            request_state.block_ids.extend(new_block_ids)
+
+        return tuple(request_state.block_ids)
 
     def free_blocks(self, request_id: str) -> None:
         """[Step 3] Release every block of the request but keep it registered
         (used by preemption: the request will be recomputed later)."""
-        raise NotImplementedError("Step 3: implement free_blocks")
+        if self.request_block_table.get(request_id) is None:
+            return
+        request_state = self.request_block_table[request_id]
+        for block_id in request_state.block_ids:
+            self.block_pool.release(block_id)
+
+        request_state.block_ids.clear()
 
     def free(self, request_id: str) -> None:
         """[Step 3] free_blocks + forget the request entirely."""
-        raise NotImplementedError("Step 3: implement free")
+        self.free_blocks(request_id)
+        if request_id in self.request_block_table:
+            del self.request_block_table[request_id]
 
     # ---- Step 15 ----------------------------------------------------------
     def find_prefix_hit(self, token_ids: tuple[int, ...]) -> PrefixHit:
