@@ -24,28 +24,34 @@ class KVCacheBlock:
 
 
 class BlockPool:
+    blocks: deque[KVCacheBlock]
+    used_blocks: list[KVCacheBlock]
+    block_map: dict[int, KVCacheBlock]
+    n_blocks: int
+
     def __init__(self, num_blocks: int) -> None:
         """[Step 2] Create num_blocks blocks; ids 0..num_blocks-2 start free (FIFO order)."""
-        raise NotImplementedError("Step 2: implement __init__")
-
+        # block_map holds the reference to all blocks by their id
+        self.block_map = {i: KVCacheBlock(block_id=i) for i in range(num_blocks - 1)}
+        self.blocks = deque(self.block_map[i] for i in range(num_blocks - 1))
+        self.used_blocks = []
+        self.n_blocks = num_blocks
     @property
     def num_blocks(self) -> int:
         """[Step 2]"""
-        raise NotImplementedError("Step 2: implement num_blocks")
-
+        return self.n_blocks
     @property
     def null_block_id(self) -> int:
         """[Step 2]"""
-        raise NotImplementedError("Step 2: implement null_block_id")
-
+        return self.n_blocks - 1
     @property
     def num_free_blocks(self) -> int:
         """[Step 2]"""
-        raise NotImplementedError("Step 2: implement num_free_blocks")
+        return len(self.blocks)
 
     def ref_count(self, block_id: int) -> int:
         """[Step 2]"""
-        raise NotImplementedError("Step 2: implement ref_count")
+        return self.block_map[block_id].ref_count if block_id in self.block_map else 0
 
     def allocate(self, count: int, cached_block_ids: Iterable[int] = ()) -> tuple[int, ...] | None:
         """[Step 2] Atomically allocate ``count`` fresh blocks (ref_count=1) from the
@@ -56,13 +62,34 @@ class BlockPool:
         out of the queue and counted against the free-block budget. A fresh block
         that still carries an old hash loses it (that is cache eviction).
         """
-        raise NotImplementedError("Step 2: implement allocate")
+        if len(self.blocks) < count:
+            return None
+        allocated = []
+        for _ in range(count):
+            block = self.blocks.popleft()
+            block.ref_count = 1
+            allocated.append(block.block_id)
+            self.used_blocks.append(block)
+
+        return tuple(allocated)
 
     def release(self, block_id: int) -> None:
         """[Step 2] Drop one reference; at zero the block goes to the TAIL of the
         free queue (so recently freed, possibly-cached blocks are reused last = LRU).
         Releasing the null block or a free block is an error."""
-        raise NotImplementedError("Step 2: implement release")
+        if block_id == self.null_block_id:
+            raise ValueError("Cannot release the null block")
+        if any(b.block_id == block_id for b in self.blocks):
+            raise ValueError("Cannot release a free block")
+
+        for b in self.used_blocks:
+            if b.block_id == block_id:
+                b.ref_count -= 1
+                if b.ref_count == 0:
+                    self.used_blocks.remove(b)
+                    self.blocks.append(b)
+                return
+        raise ValueError("Block not found")
 
     # ---- Step 15: prefix cache index -------------------------------------
     @property
