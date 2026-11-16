@@ -25,16 +25,17 @@ from minivllm.executor.interface import ModelRunnerOutput
 class Scheduler:
     engine_config: EngineConfig
     kv: KVCacheManager
-    waiting_queue: deque[Request] = deque()
+    waiting: deque[Request] = deque()
+    running: deque[Request] = deque()
     request_map: dict[str, Request] = {}
     in_flight: bool = False
-    
+
     def __init__(self, config: EngineConfig, kv: KVCacheManager) -> None:
         """[Step 4]"""
         self.engine_config = config
         self.kv = kv
-        self.waiting_queue = deque()
-        self.running_queue = deque()
+        self.waiting = deque()
+        self.running = deque()
         self.request_map = {}
         self.in_flight = False
 
@@ -44,14 +45,14 @@ class Scheduler:
         with the KV manager and append to the waiting queue."""
         if request.status != RequestStatus.WAITING:
             raise ValueError(f"Request must be in WAITING status, got {request.status}")
-        if any(r.request_id == request.request_id for r in self.waiting_queue):
+        if any(r.request_id == request.request_id for r in self.waiting):
             raise ValueError(f"Request with id {request.request_id} already exists")
         # check prompt length
         if len(request.prompt_token_ids) >= self.engine_config.max_model_len:
             raise ValueError(f"Request prompt exceeds max model length {self.engine_config.max_model_len}")
 
         self.kv.register_request(request.request_id)
-        self.waiting_queue.append(request)
+        self.waiting.append(request)
         self.request_map[request.request_id] = request
 
     def get_request(self, request_id: str) -> Request | None:
@@ -60,18 +61,23 @@ class Scheduler:
 
     def has_unfinished_requests(self) -> bool:
         """[Step 4]"""
-        return len(self.waiting_queue) > 0 or len(self.running_queue) > 0
+        return len(self.waiting) > 0 or len(self.running) > 0
 
     def abort_request(self, request_id: str) -> bool:
         """[Step 5] Finish with ABORTED, drop from queues, free all blocks.
         Return False if unknown or already finished."""
         request = self.request_map.get(request_id)
-        if request == None or request.status != RequestStatus.WAITING:
+        if request == None or request.status == RequestStatus.FINISHED:
             return False
-        del self.request_map[request_id]
-        self.waiting_queue = deque(r for r in self.waiting_queue if r.request_id != request_id)
+
+        if request in self.waiting:
+            self.waiting.remove(request)
+        if request in self.running:
+            self.running.remove(request)
+
         self.kv.free_blocks(request_id)
 
+        request.finish(FinishReason.ABORTED)
         return True
 
     # ---- planning ---------------------------------------------------------
@@ -80,7 +86,7 @@ class Scheduler:
         in flight: calling schedule() again before update() raises RuntimeError.
         Raise RuntimeError if the very first request of a plan cannot fit in the
         whole KV cache (it never could)."""
-        if not self.waiting_queue and not self.running_queue:
+        if not self.waiting and not self.running:
             return SchedulerOutput(scheduled_requests=tuple([]))
         if self.in_flight:
             raise RuntimeError("A plan is already in flight")
@@ -95,42 +101,57 @@ class Scheduler:
         # running queue is considered for scheduling as well
     
         rq_idx = 0
-        while rq_idx < len(self.running_queue) and curr_model_len < max_num_batched_tokens and curr_seq_len < max_seq_len:
-            request = self.running_queue[rq_idx]
+        cache_full = False
+        # ids preempted in THIS step only (not accumulated across steps)
+        preempted_request_ids: list[str] = []
+
+        # len(self.running) shrinks as _preempt_last() pops, so no extra bookkeeping is needed
+        while rq_idx < len(self.running) and curr_model_len < max_num_batched_tokens and curr_seq_len < max_seq_len:
+            request = self.running[rq_idx]
 
             num_new = min(request.num_pending_tokens, max_num_batched_tokens - curr_model_len)
+            scheduled_request = self._try_allocate(request, num_computed=request.num_computed_tokens, num_new=num_new)
+            # steal blocks from the newest running request, but never preempt the
+            # request we are scheduling (or anything older, already in this plan)
+            while scheduled_request is None and self.running[-1] is not request:
+                preempted_request_ids.append(self._preempt_last())
+                scheduled_request = self._try_allocate(request, num_computed=request.num_computed_tokens, num_new=num_new)
+
+            if scheduled_request is None:
+                # nothing left to preempt: it is the newest running request
+                if not scheduled_requests:
+                    # it is alone in the cache and still does not fit: it never will
+                    raise RuntimeError(f"{request.request_id} cannot fit in the KV cache")
+                # it keeps its blocks and waits for the older requests to finish
+                cache_full = True
+                break
+
+            scheduled_requests.append(scheduled_request)
             curr_model_len += num_new
             curr_seq_len += 1
-            scheduled_request = self._try_allocate(request, num_computed=request.num_computed_tokens, num_new=num_new)
-            if scheduled_request is not None:
-                scheduled_requests.append(scheduled_request)
-            else:
-                break
             rq_idx += 1
-    
+
         # no queue jumping: always take the first request in the waiting queue
-        while len(self.waiting_queue) > 0 and curr_model_len < max_num_batched_tokens and curr_seq_len < max_seq_len:
-            request = self.waiting_queue[0]
+        while not cache_full and not preempted_request_ids and len(self.waiting) > 0 and curr_model_len < max_num_batched_tokens and curr_seq_len < max_seq_len:
+            request = self.waiting[0]
 
             num_new = min(request.num_pending_tokens, max_num_batched_tokens - curr_model_len)
+            scheduled_request = self._try_allocate(request, num_computed=request.num_computed_tokens, num_new=num_new)
+            if scheduled_request is None:
+                if not scheduled_requests:
+                    # the cache is empty and it still does not fit: it never will
+                    raise RuntimeError(f"{request.request_id} cannot fit in the KV cache")
+                break
+
+            scheduled_requests.append(scheduled_request)
             curr_model_len += num_new
             curr_seq_len += 1
 
-            # if we can fit into kv cache
-            if request.num_pending_tokens >= (self.kv.block_pool.num_blocks - 1) * self.kv.block_size:
-                raise RuntimeError("Request too large to fit in KV cache")
-
-            scheduled_request = self._try_allocate(request, num_computed=request.num_computed_tokens, num_new=num_new)
-            if scheduled_request is not None:
-                scheduled_requests.append(scheduled_request)
-            else:
-                break
-            
-            self.waiting_queue.popleft()
-            self.running_queue.append(request)
+            self.waiting.popleft()
+            self.running.append(request)
             request.status = RequestStatus.RUNNING
 
-        return SchedulerOutput(scheduled_requests=tuple(scheduled_requests))
+        return SchedulerOutput(scheduled_requests=tuple(scheduled_requests), preempted_request_ids=tuple(preempted_request_ids))
         
 
     def _try_allocate(
@@ -144,10 +165,9 @@ class Scheduler:
 
         end = num_computed + num_new
         sampling = end == request.num_known_tokens
-        # prefill phase: input_token_ids is the prompt_token_ids
-        input_token_ids = tuple(request.prompt_token_ids)
-        if sampling and len(request.output_token_ids) > 0:
-            input_token_ids = tuple([request.output_token_ids[-1]])
+        # one rule covers prefill, prefill chunks, decode and recompute after preemption:
+        # feed exactly the tokens whose K/V is computed in this step
+        input_token_ids = request.all_token_ids[num_computed:end]
         # ask for physical blocks from the KV cache manager
         return ScheduledRequest(
             request_id=request.request_id,
@@ -164,7 +184,16 @@ class Scheduler:
         """[Step 5] Recompute-style preemption of the NEWEST running request:
         pop it, reset its progress, free its blocks, put it at the FRONT of the
         waiting queue. Return its id."""
-        raise NotImplementedError("Step 5: implement _preempt_last")
+        # we couldn't allocate the request, so it will be preempted
+        newest_request = self.running[-1]
+        newest_request.status = RequestStatus.WAITING
+        newest_request.num_computed_tokens = 0
+
+        self.running.pop()
+        # we need to free the blocks allocated to the preempted request
+        self.kv.free_blocks(newest_request.request_id)
+        self.waiting.appendleft(newest_request)
+        return newest_request.request_id
 
     # ---- commit -----------------------------------------------------------
     def update(self, plan: SchedulerOutput, result: ModelRunnerOutput) -> None:
@@ -209,9 +238,9 @@ class Scheduler:
                 self.kv.free_blocks(request_id)
                 request.status = RequestStatus.FINISHED
                 # remove from the running queue and waiting queue if present
-                if request in self.running_queue:
-                    self.running_queue.remove(request)
-                if request in self.waiting_queue:
-                    self.waiting_queue.remove(request)
+                if request in self.running:
+                    self.running.remove(request)
+                if request in self.waiting:
+                    self.waiting.remove(request)
 
         self.in_flight = False
